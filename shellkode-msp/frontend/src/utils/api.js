@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-var BACKEND_URL = process.env.REACT_APP_API_URL || '';
+var BACKEND_URL = 'https://msp-project-production.up.railway.app';
 
 var api = axios.create({
   baseURL: BACKEND_URL + '/api',
