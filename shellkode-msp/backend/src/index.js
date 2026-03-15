@@ -48,10 +48,3 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 module.exports = app;
-```
-
-Commit → Railway redeploys → then visit `https://msp-project-production.up.railway.app/` and you should see the JSON response.
-
-Then add to your **frontend Variables**:
-```
-REACT_APP_API_URL = https://msp-project-production.up.railway.app
