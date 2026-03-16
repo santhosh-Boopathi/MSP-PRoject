@@ -38,7 +38,8 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     const { team } = req.query;
     const query = team ? { team } : {};
-    const clients = await Client.find(query).select('-awsCredentials -awsAccounts.secretAccessKey');
+    // Include credentials so form can pre-populate (user is already authenticated)
+    const clients = await Client.find(query);
     res.json(clients);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -46,7 +47,7 @@ router.get('/', authMiddleware, async (req, res) => {
 // ── GET single client ─────────────────────────────────────────────────────────
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
-    const client = await Client.findById(req.params.id).select('-awsCredentials -awsAccounts.secretAccessKey');
+    const client = await Client.findById(req.params.id);
     if (!client) return res.status(404).json({ error: 'Client not found' });
     res.json(client);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -89,18 +90,20 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 router.post('/:id/credentials', authMiddleware, async (req, res) => {
   try {
     const { accessKeyId, secretAccessKey, regions, accounts } = req.body;
+    // Always save both key and secret - secret is required for AWS API calls
     const updateData = { awsRegions: regions || ['ap-south-1'] };
-    if (accessKeyId) {
-      updateData['awsCredentials.accessKeyId'] = accessKeyId;
-      if (secretAccessKey) updateData['awsCredentials.secretAccessKey'] = secretAccessKey;
-    }
+    if (accessKeyId) updateData['awsCredentials.accessKeyId'] = accessKeyId;
+    if (secretAccessKey) updateData['awsCredentials.secretAccessKey'] = secretAccessKey;
     if (accounts && accounts.length > 0) {
+      // Save full accounts array including secret keys
       updateData.awsAccounts = accounts;
       updateData.awsAccountId = accounts[0].accountId || '';
+      updateData.awsRegions = accounts[0].regions || regions || ['ap-south-1'];
     }
     const client = await Client.findByIdAndUpdate(req.params.id, updateData, { new: true });
-    await Activity.create({ clientId: client._id, clientName: client.name, action: 'AWS credentials updated', category: 'credentials', severity: 'success', performedBy: req.user.email, performedByName: req.user.name, details: (accounts ? accounts.length : 1) + ' account(s) configured · ' + (regions || ['ap-south-1']).join(', ') });
-    res.json({ success: true, message: 'Credentials saved', accountCount: accounts ? accounts.length : 1 });
+    const accCount = accounts ? accounts.length : (accessKeyId ? 1 : 0);
+    await Activity.create({ clientId: client._id, clientName: client.name, action: 'AWS credentials saved — ' + accCount + ' account(s)', category: 'credentials', severity: 'success', performedBy: req.user.email, performedByName: req.user.name, details: accCount + ' account(s) · regions: ' + (updateData.awsRegions || []).join(', ') });
+    res.json({ success: true, message: 'Credentials saved securely', accountCount: accCount });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
