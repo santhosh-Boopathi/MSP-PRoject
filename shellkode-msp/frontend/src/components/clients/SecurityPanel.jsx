@@ -1,180 +1,163 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import api from '../../utils/api';
-import { exportToHTML, generateSecurityReportHTML, exportToCSV } from '../../utils/exportUtils';
+import { exportToCSV } from '../../utils/exportUtils';
 
-const SEVERITY_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFORMATIONAL: 4 };
-const SEVERITY_COLORS = { CRITICAL: '#ef4444', HIGH: '#f97316', MEDIUM: '#f59e0b', LOW: '#3b82f6', INFORMATIONAL: '#06b6d4' };
+var SEV = { CRITICAL:'#ef4444', HIGH:'#f97316', MEDIUM:'#f59e0b', LOW:'#3b82f6', INFORMATIONAL:'#06b6d4' };
+var ORD = { CRITICAL:0, HIGH:1, MEDIUM:2, LOW:3, INFORMATIONAL:4 };
 
-const MOCK_FINDINGS = [
-  { id: 'SEC-001', severity: 'CRITICAL', title: 'S3 Bucket with Public Access Enabled', resource: 'arn:aws:s3:::prod-data-bucket', region: 'ap-south-1', service: 'S3', remediation: 'Enable S3 Block Public Access settings', status: 'ACTIVE' },
-  { id: 'SEC-002', severity: 'CRITICAL', title: 'Root account login detected without MFA', resource: 'arn:aws:iam::123456789:root', region: 'global', service: 'IAM', remediation: 'Enable MFA on root account and avoid using it', status: 'ACTIVE' },
-  { id: 'SEC-003', severity: 'HIGH', title: 'IAM User with Console Access & No MFA', resource: 'arn:aws:iam::123456789:user/deploy-user', region: 'global', service: 'IAM', remediation: 'Enable MFA for all IAM users with console access', status: 'ACTIVE' },
-  { id: 'SEC-004', severity: 'HIGH', title: 'Security Group allows SSH from 0.0.0.0/0', resource: 'sg-0abc123def456', region: 'ap-south-1', service: 'EC2', remediation: 'Restrict SSH access to specific IP ranges', status: 'ACTIVE' },
-  { id: 'SEC-005', severity: 'HIGH', title: 'RDS instance not encrypted at rest', resource: 'arn:aws:rds:ap-south-1:123456789:db/prod-mysql', region: 'ap-south-1', service: 'RDS', remediation: 'Enable encryption for RDS instances', status: 'ACTIVE' },
-  { id: 'SEC-006', severity: 'HIGH', title: 'Security Group allows RDP from 0.0.0.0/0', resource: 'sg-0def456abc123', region: 'ap-south-1', service: 'EC2', remediation: 'Restrict RDP to specific IP ranges only', status: 'ACTIVE' },
-  { id: 'SEC-007', severity: 'HIGH', title: 'Lambda function with AdministratorAccess IAM role', resource: 'arn:aws:lambda:ap-south-1:123456789:function:ProcessData', region: 'ap-south-1', service: 'Lambda', remediation: 'Apply least privilege principle to Lambda execution roles', status: 'ACTIVE' },
-  { id: 'SEC-008', severity: 'HIGH', title: 'EKS cluster endpoint publicly accessible', resource: 'arn:aws:eks:ap-south-1:123456789:cluster/prod-cluster', region: 'ap-south-1', service: 'EKS', remediation: 'Restrict EKS API endpoint to private access only', status: 'ACTIVE' },
-  { id: 'SEC-009', severity: 'MEDIUM', title: 'CloudTrail not enabled in all regions', resource: 'arn:aws:cloudtrail:ap-south-1:123456789:trail/main', region: 'ap-south-1', service: 'CloudTrail', remediation: 'Enable CloudTrail in all regions with multi-region trail', status: 'ACTIVE' },
-  { id: 'SEC-010', severity: 'MEDIUM', title: 'EBS volume not encrypted', resource: 'vol-0abc1234def56789', region: 'ap-south-1', service: 'EBS', remediation: 'Encrypt EBS volumes and snapshots', status: 'ACTIVE' },
-  { id: 'SEC-011', severity: 'MEDIUM', title: 'S3 bucket versioning not enabled', resource: 'arn:aws:s3:::app-logs-bucket', region: 'ap-south-1', service: 'S3', remediation: 'Enable versioning on all S3 buckets', status: 'ACTIVE' },
-  { id: 'SEC-012', severity: 'MEDIUM', title: 'EC2 instance with public IP in production subnet', resource: 'i-0abc1234def56789', region: 'ap-south-1', service: 'EC2', remediation: 'Move to private subnet and use NAT gateway', status: 'ACTIVE' },
-  { id: 'SEC-013', severity: 'MEDIUM', title: 'GuardDuty not enabled', resource: 'arn:aws:guardduty:ap-south-1:123456789', region: 'ap-south-1', service: 'GuardDuty', remediation: 'Enable GuardDuty for threat detection', status: 'ACTIVE' },
-  { id: 'SEC-014', severity: 'MEDIUM', title: 'AWS Config not enabled', resource: 'arn:aws:config:ap-south-1:123456789', region: 'ap-south-1', service: 'Config', remediation: 'Enable AWS Config for resource tracking', status: 'ACTIVE' },
-  { id: 'SEC-015', severity: 'MEDIUM', title: 'IAM password policy does not require uppercase', resource: 'arn:aws:iam::123456789', region: 'global', service: 'IAM', remediation: 'Update IAM password policy requirements', status: 'ACTIVE' },
-  { id: 'SEC-016', severity: 'MEDIUM', title: 'SQS queue not encrypted', resource: 'arn:aws:sqs:ap-south-1:123456789:orders-queue', region: 'ap-south-1', service: 'SQS', remediation: 'Enable SSE for SQS queues', status: 'ACTIVE' },
-  { id: 'SEC-017', severity: 'MEDIUM', title: 'ECR image scan on push not enabled', resource: 'arn:aws:ecr:ap-south-1:123456789:repository/app', region: 'ap-south-1', service: 'ECR', remediation: 'Enable image scanning on push in ECR', status: 'ACTIVE' },
-  { id: 'SEC-018', severity: 'LOW', title: 'Unused IAM access keys older than 90 days', resource: 'arn:aws:iam::123456789:user/old-user', region: 'global', service: 'IAM', remediation: 'Rotate or delete unused access keys', status: 'ACTIVE' },
-  { id: 'SEC-019', severity: 'LOW', title: 'VPC Flow Logs not enabled', resource: 'vpc-0abc123456', region: 'ap-south-1', service: 'VPC', remediation: 'Enable VPC Flow Logs for network monitoring', status: 'ACTIVE' },
-  { id: 'SEC-020', severity: 'LOW', title: 'CloudWatch alarms not configured for billing', resource: 'arn:aws:cloudwatch::123456789', region: 'global', service: 'CloudWatch', remediation: 'Set up billing alerts in CloudWatch', status: 'ACTIVE' },
-  { id: 'SEC-021', severity: 'LOW', title: 'S3 bucket without access logging', resource: 'arn:aws:s3:::static-assets', region: 'ap-south-1', service: 'S3', remediation: 'Enable server access logging on S3 buckets', status: 'ACTIVE' },
-  { id: 'SEC-022', severity: 'LOW', title: 'RDS automated backup retention less than 7 days', resource: 'arn:aws:rds:ap-south-1:123456789:db/staging-pg', region: 'ap-south-1', service: 'RDS', remediation: 'Set backup retention period to minimum 7 days', status: 'ACTIVE' },
-  { id: 'SEC-023', severity: 'LOW', title: 'SNS topics not encrypted', resource: 'arn:aws:sns:ap-south-1:123456789:alerts', region: 'ap-south-1', service: 'SNS', remediation: 'Enable SSE for SNS topics', status: 'ACTIVE' },
-  { id: 'SEC-024', severity: 'LOW', title: 'EC2 instance using outdated AMI', resource: 'i-0def5678abc12345', region: 'ap-south-1', service: 'EC2', remediation: 'Update to latest Amazon Linux 2023 AMI', status: 'ACTIVE' },
-  { id: 'SEC-025', severity: 'INFORMATIONAL', title: 'CloudFront distribution without WAF', resource: 'arn:aws:cloudfront::123456789:distribution/ABC123', region: 'global', service: 'CloudFront', remediation: 'Associate WAF WebACL with CloudFront distribution', status: 'ACTIVE' },
-  { id: 'SEC-026', severity: 'INFORMATIONAL', title: 'IAM user with both console and programmatic access', resource: 'arn:aws:iam::123456789:user/dev-user', region: 'global', service: 'IAM', remediation: 'Separate console and programmatic access users', status: 'ACTIVE' },
-  { id: 'SEC-027', severity: 'INFORMATIONAL', title: 'ElastiCache cluster not in VPC', resource: 'arn:aws:elasticache:ap-south-1:123456789:cluster/cache', region: 'ap-south-1', service: 'ElastiCache', remediation: 'Move ElastiCache to VPC', status: 'ACTIVE' },
-];
+function exportHTML(clientName, findings, summary) {
+  var rows = findings.map(function(f) {
+    return '<tr><td style="font-family:monospace;font-size:11px">'+f.id+'</td><td><span class="badge '+f.severity.toLowerCase()+'">'+f.severity+'</span></td><td>'+f.title+'</td><td>'+f.service+'</td><td>'+f.region+'</td><td style="font-size:11px">'+f.remediation+'</td></tr>';
+  }).join('');
+  var html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Security Report - '+clientName+'</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Segoe UI,sans-serif;background:#f8fafc;color:#1e293b;padding:30px}.header{background:linear-gradient(135deg,#1e40af,#0891b2);color:white;padding:30px;border-radius:12px;margin-bottom:24px}.header h1{font-size:26px;margin-bottom:4px}.meta{font-size:13px;opacity:.8;margin-top:8px}.summary{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:24px}.card{background:white;border-radius:10px;padding:16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06)}.card .val{font-size:28px;font-weight:800}.card .lbl{font-size:11px;color:#64748b;margin-top:4px}table{width:100%;border-collapse:collapse;background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)}th{background:#1e40af;color:white;padding:11px 14px;text-align:left;font-size:12px}td{padding:10px 14px;border-bottom:1px solid #f1f5f9;font-size:13px}.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:700}.critical{background:#fef2f2;color:#dc2626}.high{background:#fff7ed;color:#ea580c}.medium{background:#fffbeb;color:#d97706}.low{background:#eff6ff;color:#2563eb}.informational{background:#ecfeff;color:#0891b2}</style></head><body>';
+  html += '<div class="header"><h1>Security Audit Report — '+clientName+'</h1><div class="meta">Generated: '+new Date().toLocaleString('en-IN')+' | Team Cronos | ShellKode MSP</div></div>';
+  html += '<div class="summary"><div class="card"><div class="val" style="color:#dc2626">'+summary.critical+'</div><div class="lbl">Critical</div></div><div class="card"><div class="val" style="color:#ea580c">'+summary.high+'</div><div class="lbl">High</div></div><div class="card"><div class="val" style="color:#d97706">'+summary.medium+'</div><div class="lbl">Medium</div></div><div class="card"><div class="val" style="color:#2563eb">'+summary.low+'</div><div class="lbl">Low</div></div><div class="card"><div class="val" style="color:#0891b2">'+summary.informational+'</div><div class="lbl">Info</div></div><div class="card"><div class="val" style="color:'+(summary.score>=80?'#16a34a':summary.score>=60?'#d97706':'#dc2626')+'">'+summary.score+'</div><div class="lbl">Score/100</div></div></div>';
+  html += '<table><thead><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Service</th><th>Region</th><th>Remediation</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  html += '<div style="text-align:center;margin-top:30px;color:#94a3b8;font-size:12px">ShellKode MSP Portal — Team Cronos — Confidential</div></body></html>';
+  var b = new Blob([html], { type:'text/html' });
+  var a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'Security_'+clientName+'_'+new Date().toISOString().split('T')[0]+'.html'; a.click(); URL.revokeObjectURL(a.href);
+}
 
-export default function SecurityPanel({ clientId, clientName }) {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [filter, setFilter] = useState('ALL');
-  const [serviceFilter, setServiceFilter] = useState('ALL');
-  const [search, setSearch] = useState('');
-  const [page, setPage] = useState(1);
-  const PER_PAGE = 25;
+export default function SecurityPanel(props) {
+  var clientId = props.clientId; var clientName = props.clientName;
+  var [data, setData] = useState(null);
+  var [loading, setLoading] = useState(false);
+  var [filter, setFilter] = useState('ALL');
+  var [svcFilter, setSvcFilter] = useState('ALL');
+  var [search, setSearch] = useState('');
+  var [page, setPage] = useState(1);
+  var PER = 25;
 
-  const runScan = () => {
-    setLoading(true);
-    setPage(1);
-    api.get('/aws/security/' + clientId)
-      .then(() => {})
-      .catch(() => {});
-    setTimeout(() => {
-      setData({
-        summary: { critical: 2, high: 6, medium: 9, low: 7, informational: 3, score: Math.floor(Math.random() * 25) + 50 },
-        findings: MOCK_FINDINGS
-      });
-      setLoading(false);
-    }, 1800);
+  var runScan = function() {
+    setLoading(true); setData(null); setFilter('ALL'); setSvcFilter('ALL'); setSearch(''); setPage(1);
+    api.get('/aws/security/' + clientId).then(function(r) {
+      setData(r.data);
+    }).catch(function(e) {
+      setData({ hasCredentials: false, hasData: false, message: e.response?.data?.error || e.message });
+    }).finally(function() { setLoading(false); });
   };
 
-  useEffect(() => { runScan(); }, [clientId]);
-
-  const services = data ? ['ALL', ...new Set(data.findings.map(f => f.service)).values()] : ['ALL'];
-
-  const filtered = (data ? data.findings : [])
-    .filter(f => filter === 'ALL' || f.severity === filter)
-    .filter(f => serviceFilter === 'ALL' || f.service === serviceFilter)
-    .filter(f => !search || f.title.toLowerCase().includes(search.toLowerCase()) || f.service.toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
-
-  const totalPages = Math.ceil(filtered.length / PER_PAGE);
-  const paginated = filtered.slice((page - 1) * PER_PAGE, page * PER_PAGE);
-
-  const handleExportHTML = () => {
-    if (!data) return;
-    exportToHTML('Security Audit -- ' + clientName, generateSecurityReportHTML(clientName, { summary: data.summary, findings: filtered }));
-  };
-  const handleExportCSV = () => {
-    if (!data) return;
-    exportToCSV('Security_' + clientName,
-      ['ID', 'Severity', 'Finding', 'Service', 'Region', 'Resource', 'Remediation', 'Status'],
-      filtered.map(function(f) { return [f.id, f.severity, f.title, f.service, f.region, f.resource, f.remediation, f.status]; })
-    );
-  };
+  var services = data?.findings ? ['ALL', ...new Set(data.findings.map(function(f){return f.service;}))] : ['ALL'];
+  var filtered = (data?.findings || []).filter(function(f){
+    return (filter==='ALL'||f.severity===filter) && (svcFilter==='ALL'||f.service===svcFilter) && (!search||f.title.toLowerCase().includes(search.toLowerCase())||f.service.toLowerCase().includes(search.toLowerCase()));
+  }).sort(function(a,b){return ORD[a.severity]-ORD[b.severity];});
+  var totalPages = Math.ceil(filtered.length / PER);
+  var paged = filtered.slice((page-1)*PER, page*PER);
 
   return (
-    <div style={st.panel}>
-      <div style={st.header}>
+    <div style={{ animation:'fadeIn 0.4s ease' }}>
+      <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:20, flexWrap:'wrap', gap:12 }}>
         <div>
-          <h2 style={st.title}>🛡️ Security Audit</h2>
-          <p style={st.sub}>AWS Security Hub · CIS Benchmarks · Best Practices · All {data ? data.findings.length : 0} findings shown</p>
+          <h2 style={{ fontFamily:"'Sora',sans-serif", fontSize:22, fontWeight:700, color:'#f0f4ff', marginBottom:4 }}>🛡️ Security Audit</h2>
+          <p style={{ color:'#64748b', fontSize:13 }}>Click "Run Scan" to fetch real-time findings from your AWS account</p>
         </div>
-        <div style={st.actions}>
-          <button onClick={runScan} disabled={loading} style={st.scanBtn}>
-            {loading ? 'Scanning...' : '🔍 Run Scan'}
+        <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
+          <button onClick={runScan} disabled={loading}
+            style={{ padding:'10px 20px', background:'linear-gradient(135deg, #3b82f6, #06b6d4)', border:'none', borderRadius:10, color:'white', fontSize:13, fontWeight:600, cursor:loading?'not-allowed':'pointer', display:'flex', alignItems:'center', gap:8, opacity:loading?0.7:1 }}>
+            {loading ? <><span className="spinner" style={{width:14,height:14,borderWidth:2}}/> Scanning AWS...</> : '🔍 Run Security Scan'}
           </button>
-          {data && <button onClick={handleExportHTML} style={st.exportBtn}>📄 HTML</button>}
-          {data && <button onClick={handleExportCSV} style={st.exportBtn}>📊 CSV</button>}
+          {data?.hasData && <button onClick={function(){exportHTML(clientName,filtered,data.summary);}} style={{ padding:'10px 14px', background:'rgba(255,255,255,0.04)', border:'1px solid #2a3a58', borderRadius:10, color:'#8a9bc5', fontSize:13, cursor:'pointer' }}>📄 HTML Report</button>}
+          {data?.hasData && <button onClick={function(){exportToCSV('Security_'+clientName,['ID','Severity','Finding','Service','Region','Resource','Remediation'],filtered.map(function(f){return[f.id,f.severity,f.title,f.service,f.region,f.resource,f.remediation];}));}} style={{ padding:'10px 14px', background:'rgba(255,255,255,0.04)', border:'1px solid #2a3a58', borderRadius:10, color:'#8a9bc5', fontSize:13, cursor:'pointer' }}>📊 Export CSV</button>}
         </div>
       </div>
 
-      {loading && !data && (
-        <div style={st.loading}>
-          <div className="spinner" style={{ width: 40, height: 40, borderWidth: 3 }} />
-          <p style={{ color: '#4a5878', marginTop: 12 }}>Scanning {clientName}...</p>
+      {/* Not run yet */}
+      {!data && !loading && (
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:60, background:'#111827', border:'1px solid #1e2d47', borderRadius:14, textAlign:'center' }}>
+          <div style={{ fontSize:48, marginBottom:14 }}>🛡️</div>
+          <div style={{ color:'#e2e8f0', fontSize:16, fontWeight:600, marginBottom:6 }}>Security Audit Not Run Yet</div>
+          <div style={{ color:'#4a5878', fontSize:13, maxWidth:400, marginBottom:20 }}>Click "Run Security Scan" to analyse your entire AWS account including IAM, EC2, RDS, S3, CloudTrail and more.</div>
+          <button onClick={runScan} style={{ padding:'11px 28px', background:'linear-gradient(135deg, #3b82f6, #06b6d4)', border:'none', borderRadius:10, color:'white', fontSize:14, fontWeight:600, cursor:'pointer' }}>🔍 Run Security Scan Now</button>
         </div>
       )}
 
-      {data && (
+      {loading && (
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:280, background:'#111827', border:'1px solid #1e2d47', borderRadius:14 }}>
+          <div className="spinner" style={{ width:40, height:40, borderWidth:3, marginBottom:14 }} />
+          <div style={{ color:'#8a9bc5', fontSize:14 }}>Scanning AWS account for {clientName}...</div>
+          <div style={{ color:'#4a5878', fontSize:12, marginTop:6 }}>Checking IAM, EC2, RDS, S3, CloudTrail...</div>
+        </div>
+      )}
+
+      {/* Error / no credentials */}
+      {data && !data.hasCredentials && (
+        <div style={{ padding:32, background:'rgba(245,158,11,0.06)', border:'1px solid rgba(245,158,11,0.2)', borderRadius:14, textAlign:'center' }}>
+          <div style={{ fontSize:32, marginBottom:10 }}>🔑</div>
+          <div style={{ color:'#fbbf24', fontSize:15, fontWeight:600, marginBottom:6 }}>AWS Credentials Not Configured</div>
+          <div style={{ color:'#4a5878', fontSize:13 }}>{data.message}</div>
+        </div>
+      )}
+
+      {data && data.hasCredentials && !data.hasData && (
+        <div style={{ padding:32, background:'rgba(239,68,68,0.06)', border:'1px solid rgba(239,68,68,0.2)', borderRadius:14, textAlign:'center' }}>
+          <div style={{ fontSize:32, marginBottom:10 }}>❌</div>
+          <div style={{ color:'#f87171', fontSize:15, fontWeight:600, marginBottom:6 }}>Scan Failed</div>
+          <div style={{ color:'#4a5878', fontSize:13, maxWidth:400, margin:'0 auto' }}>{data.message}</div>
+          {data.credentialError && <div style={{ color:'#fbbf24', fontSize:12, marginTop:8 }}>Please update AWS credentials in client settings.</div>}
+        </div>
+      )}
+
+      {data?.hasData && data.findings && (
         <>
-          <div style={st.summaryRow}>
-            <div style={st.scoreCard}>
+          {/* Score + summary */}
+          <div style={{ display:'flex', gap:16, marginBottom:20, flexWrap:'wrap', alignItems:'flex-start' }}>
+            <div style={{ background:'#111827', border:'1px solid #1e2d47', borderRadius:14, padding:'20px 24px', display:'flex', flexDirection:'column', alignItems:'center', gap:8 }}>
               <svg width="110" height="110" viewBox="0 0 120 120">
                 <circle cx="60" cy="60" r="50" fill="none" stroke="#1e2d47" strokeWidth="10"/>
-                <circle cx="60" cy="60" r="50" fill="none"
-                  stroke={data.summary.score >= 80 ? '#10b981' : data.summary.score >= 60 ? '#f59e0b' : '#ef4444'}
-                  strokeWidth="10" strokeLinecap="round"
-                  strokeDasharray={String(2 * Math.PI * 50 * data.summary.score / 100) + ' ' + String(2 * Math.PI * 50)}
-                  transform="rotate(-90 60 60)" />
+                <circle cx="60" cy="60" r="50" fill="none" stroke={data.summary.score>=80?'#10b981':data.summary.score>=60?'#f59e0b':'#ef4444'} strokeWidth="10" strokeLinecap="round" strokeDasharray={String(2*Math.PI*50*data.summary.score/100)+' '+String(2*Math.PI*50)} transform="rotate(-90 60 60)"/>
                 <text x="60" y="55" textAnchor="middle" fill="#f0f4ff" fontSize="24" fontWeight="800">{data.summary.score}</text>
                 <text x="60" y="72" textAnchor="middle" fill="#4a5878" fontSize="10">/100</text>
               </svg>
-              <div style={{ color: data.summary.score >= 60 ? '#f59e0b' : '#ef4444', fontSize: 11, fontWeight: 600 }}>
-                {data.summary.score >= 80 ? 'GOOD' : data.summary.score >= 60 ? 'FAIR' : 'NEEDS ATTENTION'}
-              </div>
+              <div style={{ color:data.summary.score>=60?'#f59e0b':'#ef4444', fontSize:11, fontWeight:700 }}>{data.summary.score>=80?'GOOD':data.summary.score>=60?'FAIR':'NEEDS ATTENTION'}</div>
+              <div style={{ color:'#4a5878', fontSize:10 }}>Scanned: {data.scannedAt ? new Date(data.scannedAt).toLocaleString('en-IN') : ''}</div>
             </div>
-            <div style={st.sevGrid}>
-              {Object.entries(SEVERITY_COLORS).map(function(entry) {
-                var sev = entry[0]; var color = entry[1];
+            <div style={{ flex:1, display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(90px, 1fr))', gap:10 }}>
+              {Object.entries(SEV).map(function(entry) {
+                var sev=entry[0]; var color=entry[1];
                 return (
-                  <div key={sev} onClick={function() { setFilter(filter === sev ? 'ALL' : sev); setPage(1); }}
-                    style={{ ...st.sevCard, borderColor: color + '33', outline: filter === sev ? ('2px solid ' + color) : 'none', cursor: 'pointer' }}>
-                    <div style={{ fontSize: 26, fontWeight: 800, color: color }}>{data.summary[sev.toLowerCase()] || 0}</div>
-                    <div style={{ color: '#4a5878', fontSize: 10, marginTop: 2 }}>{sev}</div>
+                  <div key={sev} onClick={function(){setFilter(filter===sev?'ALL':sev); setPage(1);}}
+                    style={{ background:'#111827', border:'1px solid '+(filter===sev?color:color+'33'), borderRadius:12, padding:'14px 10px', textAlign:'center', cursor:'pointer', outline:filter===sev?'2px solid '+color:'none' }}>
+                    <div style={{ fontSize:24, fontWeight:800, color:color }}>{data.summary[sev.toLowerCase()]||0}</div>
+                    <div style={{ color:'#4a5878', fontSize:9, marginTop:3, textTransform:'uppercase' }}>{sev}</div>
                   </div>
                 );
               })}
-              <div onClick={function() { setFilter('ALL'); setPage(1); }}
-                style={{ ...st.sevCard, borderColor: '#3b82f633', outline: filter === 'ALL' ? '2px solid #3b82f6' : 'none', cursor: 'pointer' }}>
-                <div style={{ fontSize: 26, fontWeight: 800, color: '#3b82f6' }}>{data.findings.length}</div>
-                <div style={{ color: '#4a5878', fontSize: 10, marginTop: 2 }}>TOTAL</div>
+              <div onClick={function(){setFilter('ALL');setPage(1);}} style={{ background:'#111827', border:'1px solid '+(filter==='ALL'?'#3b82f6':'#3b82f633'), borderRadius:12, padding:'14px 10px', textAlign:'center', cursor:'pointer', outline:filter==='ALL'?'2px solid #3b82f6':'none' }}>
+                <div style={{ fontSize:24, fontWeight:800, color:'#3b82f6' }}>{data.findings.length}</div>
+                <div style={{ color:'#4a5878', fontSize:9, marginTop:3, textTransform:'uppercase' }}>TOTAL</div>
               </div>
             </div>
           </div>
 
-          <div style={st.filtersRow}>
-            <input value={search} onChange={function(e) { setSearch(e.target.value); setPage(1); }}
-              placeholder="Search findings, services..." style={st.searchInput} />
-            <select value={serviceFilter} onChange={function(e) { setServiceFilter(e.target.value); setPage(1); }} style={st.select}>
-              {services.map(function(s) { return <option key={s} value={s}>{s === 'ALL' ? 'All Services' : s}</option>; })}
+          {/* Filters */}
+          <div style={{ display:'flex', gap:10, marginBottom:12, flexWrap:'wrap', alignItems:'center' }}>
+            <input value={search} onChange={function(e){setSearch(e.target.value);setPage(1);}} placeholder="Search findings..." style={{ flex:1, minWidth:180, padding:'8px 12px', background:'#111827', border:'1px solid #1e2d47', borderRadius:9, color:'#f0f4ff', fontSize:13, outline:'none' }} />
+            <select value={svcFilter} onChange={function(e){setSvcFilter(e.target.value);setPage(1);}} style={{ padding:'8px 12px', background:'#111827', border:'1px solid #1e2d47', borderRadius:9, color:'#8a9bc5', fontSize:13, outline:'none', cursor:'pointer' }}>
+              {services.map(function(s){return <option key={s} value={s}>{s==='ALL'?'All Services':s}</option>;})}
             </select>
-            <span style={{ color: '#4a5878', fontSize: 12 }}>{filtered.length} findings</span>
+            <span style={{ color:'#4a5878', fontSize:12 }}>{filtered.length} findings</span>
           </div>
 
-          <div style={st.tableWrap}>
-            <table style={st.table}>
+          <div style={{ background:'#111827', border:'1px solid #1e2d47', borderRadius:14, overflowX:'auto' }}>
+            <table style={{ width:'100%', borderCollapse:'collapse', minWidth:800 }}>
               <thead>
-                <tr style={{ background: '#0d1424' }}>
-                  {['ID','Severity','Finding','Service','Region','Resource','Remediation'].map(function(h) {
-                    return <th key={h} style={st.th}>{h}</th>;
-                  })}
+                <tr style={{ background:'#0d1424' }}>
+                  {['ID','Severity','Finding','Service','Region','Resource','Remediation'].map(function(h){return <th key={h} style={{ padding:'9px 14px', textAlign:'left', color:'#4a5878', fontSize:10, fontWeight:600, textTransform:'uppercase', whiteSpace:'nowrap' }}>{h}</th>;})}
                 </tr>
               </thead>
               <tbody>
-                {paginated.map(function(f, i) {
+                {paged.map(function(f,i){
                   return (
-                    <tr key={i} style={{ borderBottom: '1px solid #1a2540', background: i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.01)' }}>
-                      <td style={{ ...st.td, fontFamily: 'monospace', fontSize: 11, color: '#4a5878' }}>{f.id}</td>
-                      <td style={st.td}>
-                        <span className={'badge badge-' + (f.severity.toLowerCase() === 'informational' ? 'info' : f.severity.toLowerCase())}>{f.severity}</span>
+                    <tr key={i} style={{ borderBottom:'1px solid #1a2540', background:i%2===0?'transparent':'rgba(255,255,255,0.01)' }}>
+                      <td style={{ padding:'10px 14px', fontFamily:'monospace', fontSize:11, color:'#4a5878' }}>{f.id}</td>
+                      <td style={{ padding:'10px 14px' }}>
+                        <span style={{ background:SEV[f.severity]+'18', color:SEV[f.severity], border:'1px solid '+SEV[f.severity]+'44', borderRadius:20, padding:'2px 9px', fontSize:10, fontWeight:700 }}>{f.severity}</span>
                       </td>
-                      <td style={{ ...st.td, color: '#e2e8f0', fontWeight: 500, minWidth: 200 }}>{f.title}</td>
-                      <td style={{ ...st.td, color: '#06b6d4', fontSize: 12 }}>{f.service}</td>
-                      <td style={{ ...st.td, fontFamily: 'monospace', fontSize: 11, color: '#4a5878' }}>{f.region}</td>
-                      <td style={{ ...st.td, fontFamily: 'monospace', fontSize: 10, color: '#2a3a58', maxWidth: 160, wordBreak: 'break-all' }}>{f.resource}</td>
-                      <td style={{ ...st.td, color: '#94a3b8', fontSize: 12, minWidth: 160 }}>{f.remediation}</td>
+                      <td style={{ padding:'10px 14px', color:'#e2e8f0', fontWeight:500, minWidth:200 }}>{f.title}</td>
+                      <td style={{ padding:'10px 14px', color:'#06b6d4', fontSize:12 }}>{f.service}</td>
+                      <td style={{ padding:'10px 14px', fontFamily:'monospace', fontSize:11, color:'#4a5878' }}>{f.region}</td>
+                      <td style={{ padding:'10px 14px', fontFamily:'monospace', fontSize:10, color:'#2a3a58', maxWidth:160, wordBreak:'break-all' }}>{f.resource}</td>
+                      <td style={{ padding:'10px 14px', color:'#94a3b8', fontSize:12, minWidth:150 }}>{f.remediation}</td>
                     </tr>
                   );
                 })}
@@ -183,10 +166,10 @@ export default function SecurityPanel({ clientId, clientName }) {
           </div>
 
           {totalPages > 1 && (
-            <div style={st.pagination}>
-              <button onClick={function() { setPage(function(p) { return Math.max(1, p - 1); }); }} disabled={page === 1} style={st.pageBtn}>← Prev</button>
-              <span style={{ color: '#8a9bc5', fontSize: 13 }}>Page {page} of {totalPages} · {filtered.length} findings</span>
-              <button onClick={function() { setPage(function(p) { return Math.min(totalPages, p + 1); }); }} disabled={page === totalPages} style={st.pageBtn}>Next →</button>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginTop:12, padding:'10px 14px', background:'#111827', border:'1px solid #1e2d47', borderRadius:10 }}>
+              <button onClick={function(){setPage(function(p){return Math.max(1,p-1);});}} disabled={page===1} style={{ padding:'6px 14px', background:'rgba(59,130,246,0.1)', border:'1px solid rgba(59,130,246,0.25)', borderRadius:8, color:'#60a5fa', fontSize:13, cursor:'pointer' }}>← Prev</button>
+              <span style={{ color:'#8a9bc5', fontSize:13 }}>Page {page} of {totalPages} · {filtered.length} findings</span>
+              <button onClick={function(){setPage(function(p){return Math.min(totalPages,p+1);});}} disabled={page===totalPages} style={{ padding:'6px 14px', background:'rgba(59,130,246,0.1)', border:'1px solid rgba(59,130,246,0.25)', borderRadius:8, color:'#60a5fa', fontSize:13, cursor:'pointer' }}>Next →</button>
             </div>
           )}
         </>
@@ -194,27 +177,3 @@ export default function SecurityPanel({ clientId, clientName }) {
     </div>
   );
 }
-
-var st = {
-  panel: { animation: 'fadeIn 0.4s ease' },
-  header: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 12 },
-  title: { fontFamily: "'Sora', sans-serif", fontSize: 22, fontWeight: 700, color: '#f0f4ff', marginBottom: 4 },
-  sub: { color: '#64748b', fontSize: 13 },
-  actions: { display: 'flex', gap: 10, flexWrap: 'wrap' },
-  scanBtn: { padding: '10px 18px', background: 'linear-gradient(135deg, #3b82f6, #06b6d4)', border: 'none', borderRadius: 10, color: 'white', fontSize: 13, fontWeight: 600, cursor: 'pointer' },
-  exportBtn: { padding: '10px 14px', background: 'rgba(255,255,255,0.04)', border: '1px solid #2a3a58', borderRadius: 10, color: '#8a9bc5', fontSize: 13, cursor: 'pointer' },
-  loading: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 280, background: '#111827', borderRadius: 14, border: '1px solid #1e2d47' },
-  summaryRow: { display: 'flex', gap: 20, marginBottom: 20, flexWrap: 'wrap', alignItems: 'flex-start' },
-  scoreCard: { background: '#111827', border: '1px solid #1e2d47', borderRadius: 16, padding: '20px 24px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 },
-  sevGrid: { flex: 1, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(90px, 1fr))', gap: 10 },
-  sevCard: { background: '#111827', border: '1px solid', borderRadius: 12, padding: '14px 10px', textAlign: 'center', transition: 'all 0.2s' },
-  filtersRow: { display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap', alignItems: 'center' },
-  searchInput: { flex: 1, minWidth: 200, padding: '9px 14px', background: '#111827', border: '1px solid #1e2d47', borderRadius: 10, color: '#f0f4ff', fontSize: 13, outline: 'none' },
-  select: { padding: '9px 12px', background: '#111827', border: '1px solid #1e2d47', borderRadius: 10, color: '#8a9bc5', fontSize: 13, outline: 'none', cursor: 'pointer' },
-  tableWrap: { background: '#111827', border: '1px solid #1e2d47', borderRadius: 14, overflowX: 'auto' },
-  table: { width: '100%', borderCollapse: 'collapse', minWidth: 800 },
-  th: { padding: '10px 14px', textAlign: 'left', color: '#4a5878', fontSize: 11, fontWeight: 600, letterSpacing: '0.5px', textTransform: 'uppercase', whiteSpace: 'nowrap' },
-  td: { padding: '11px 14px', fontSize: 13, color: '#94a3b8', verticalAlign: 'top' },
-  pagination: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 12, padding: '10px 16px', background: '#111827', border: '1px solid #1e2d47', borderRadius: 10 },
-  pageBtn: { padding: '7px 16px', background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.25)', borderRadius: 8, color: '#60a5fa', fontSize: 13, cursor: 'pointer' },
-};
