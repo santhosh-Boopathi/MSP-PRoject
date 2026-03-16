@@ -2,171 +2,174 @@ const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
 const Client = require('../models/Client');
+const Activity = require('../models/Activity');
 
-// ─── AWS SDK imports (only used when credentials provided) ───────────────────
-let EC2Client, DescribeInstancesCommand, DescribeRegionsCommand,
-    DescribeVolumesCommand, DescribeSnapshotsCommand, DescribeAddressesCommand,
-    DescribeImagesCommand, DescribeSecurityGroupsCommand, DescribeVpcsCommand;
-let RDSClient, DescribeDBInstancesCommand, DescribeDBSnapshotsCommand;
-let S3Client, ListBucketsCommand;
-let LambdaClient, ListFunctionsCommand;
-let CostExplorerClient, GetCostAndUsageCommand, GetCostAndUsageWithResourcesCommand, GetAnomaliesCommand;
-let IAMClient, ListUsersCommand, GetAccountPasswordPolicyCommand, ListMFADevicesCommand, GetAccountSummaryCommand;
-let CloudTrailClient, DescribeTrailsCommand;
-let ComputeOptimizerClient, GetEC2InstanceRecommendationsCommand, GetEBSVolumeRecommendationsCommand, GetLambdaFunctionRecommendationsCommand;
-let STSClient, GetCallerIdentityCommand;
+// Try loading AWS SDK modules
+const aws = {};
+const tryLoad = (pkg, key) => { try { aws[key] = require(pkg); } catch (e) { aws[key] = null; } };
+tryLoad('@aws-sdk/client-ec2', 'ec2');
+tryLoad('@aws-sdk/client-rds', 'rds');
+tryLoad('@aws-sdk/client-s3', 's3');
+tryLoad('@aws-sdk/client-lambda', 'lambda');
+tryLoad('@aws-sdk/client-iam', 'iam');
+tryLoad('@aws-sdk/client-cost-explorer', 'ce');
+tryLoad('@aws-sdk/client-cloudtrail', 'ct');
+tryLoad('@aws-sdk/client-sts', 'sts');
 
-try {
-  ({ EC2Client, DescribeInstancesCommand, DescribeRegionsCommand, DescribeVolumesCommand,
-     DescribeSnapshotsCommand, DescribeAddressesCommand, DescribeImagesCommand,
-     DescribeSecurityGroupsCommand, DescribeVpcsCommand } = require('@aws-sdk/client-ec2'));
-  ({ RDSClient, DescribeDBInstancesCommand, DescribeDBSnapshotsCommand } = require('@aws-sdk/client-rds'));
-  ({ S3Client, ListBucketsCommand } = require('@aws-sdk/client-s3'));
-  ({ LambdaClient, ListFunctionsCommand } = require('@aws-sdk/client-lambda'));
-  ({ CostExplorerClient, GetCostAndUsageCommand } = require('@aws-sdk/client-cost-explorer'));
-  ({ IAMClient, ListUsersCommand, GetAccountPasswordPolicyCommand, ListMFADevicesCommand, GetAccountSummaryCommand } = require('@aws-sdk/client-iam'));
-  ({ CloudTrailClient, DescribeTrailsCommand } = require('@aws-sdk/client-cloudtrail'));
-  ({ STSClient, GetCallerIdentityCommand } = require('@aws-sdk/client-sts'));
-  console.log('✅ AWS SDK loaded');
-} catch (e) {
-  console.log('⚠️ AWS SDK not installed — running in mock mode');
-}
+const SDK_AVAILABLE = !!(aws.ec2 && aws.iam && aws.ce && aws.sts);
+console.log('AWS SDK available:', SDK_AVAILABLE);
 
-// ─── Helper: get credentials for client ──────────────────────────────────────
-async function getCredentials(clientId, accountIndex = 0) {
+// ── Helper: get credentials ──────────────────────────────────────────────────
+async function getCreds(clientId, accountIndex = 0) {
   const client = await Client.findById(clientId);
-  if (!client) throw new Error('Client not found');
+  if (!client) throw { code: 'NOT_FOUND', message: 'Client not found' };
 
-  // Support multiple accounts
-  const accounts = client.awsAccounts || [];
-  if (accounts.length > 0 && accounts[accountIndex]) {
-    const acc = accounts[accountIndex];
-    if (!acc.accessKeyId || !acc.secretAccessKey) throw new Error('AWS credentials not configured');
-    return {
-      credentials: { accessKeyId: acc.accessKeyId, secretAccessKey: acc.secretAccessKey },
-      regions: acc.regions || client.awsRegions || ['ap-south-1'],
-      primaryRegion: (acc.regions || client.awsRegions || ['ap-south-1'])[0],
-      accountLabel: acc.label || 'Primary'
-    };
+  // Multi-account support
+  const accs = client.awsAccounts || [];
+  if (accs.length > accountIndex && accs[accountIndex].accessKeyId && accs[accountIndex].secretAccessKey) {
+    const acc = accs[accountIndex];
+    return { creds: { accessKeyId: acc.accessKeyId, secretAccessKey: acc.secretAccessKey }, regions: acc.regions || client.awsRegions || ['ap-south-1'], primaryRegion: (acc.regions || client.awsRegions || ['ap-south-1'])[0], label: acc.label || 'Account ' + (accountIndex + 1), allAccounts: accs };
   }
-
-  if (!client.awsCredentials?.accessKeyId || !client.awsCredentials?.secretAccessKey) {
-    throw new Error('AWS credentials not configured for this client');
+  if (client.awsCredentials?.accessKeyId && client.awsCredentials?.secretAccessKey) {
+    return { creds: { accessKeyId: client.awsCredentials.accessKeyId, secretAccessKey: client.awsCredentials.secretAccessKey }, regions: client.awsRegions || ['ap-south-1'], primaryRegion: (client.awsRegions || ['ap-south-1'])[0], label: 'Primary Account', allAccounts: [] };
   }
-  return {
-    credentials: { accessKeyId: client.awsCredentials.accessKeyId, secretAccessKey: client.awsCredentials.secretAccessKey },
-    regions: client.awsRegions || ['ap-south-1'],
-    primaryRegion: (client.awsRegions || ['ap-south-1'])[0],
-    accountLabel: 'Primary'
-  };
+  throw { code: 'NO_CREDENTIALS', message: 'AWS credentials not configured for this client. Add IAM access key and secret key.' };
 }
 
-// ─── Verify AWS connection ────────────────────────────────────────────────────
+const noCredsResp = (res, msg) => res.json({ hasCredentials: false, hasData: false, message: msg || 'AWS credentials not configured' });
+const noSdkResp = (res) => res.json({ hasCredentials: true, hasData: false, message: 'AWS SDK packages not installed on server. Run: npm install in backend.' });
+const credErrResp = (res, err) => {
+  if (err.name === 'InvalidClientTokenId' || err.name === 'InvalidAccessKeyId') return res.json({ hasCredentials: true, hasData: false, message: 'Invalid AWS Access Key ID. Please check credentials.', credentialError: true });
+  if (err.name === 'SignatureDoesNotMatch') return res.json({ hasCredentials: true, hasData: false, message: 'Invalid AWS Secret Access Key. Please check credentials.', credentialError: true });
+  if (err.name === 'AuthFailure') return res.json({ hasCredentials: true, hasData: false, message: 'AWS Authentication failed. Check your credentials.', credentialError: true });
+  return res.json({ hasCredentials: true, hasData: false, message: 'AWS Error: ' + err.message });
+};
+
+// ── VERIFY CONNECTION ─────────────────────────────────────────────────────────
 router.post('/verify/:clientId', authMiddleware, async (req, res) => {
   try {
-    const { credentials, primaryRegion } = await getCredentials(req.params.clientId);
-    if (!STSClient) return res.json({ connected: false, error: 'AWS SDK not available' });
-
-    const sts = new STSClient({ ...credentials, region: primaryRegion });
-    const identity = await sts.send(new GetCallerIdentityCommand({}));
-    res.json({ connected: true, accountId: identity.Account, arn: identity.Arn, userId: identity.UserId });
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds, primaryRegion, label } = await getCreds(req.params.clientId, accIdx);
+    if (!aws.sts) return noSdkResp(res);
+    const { STSClient, GetCallerIdentityCommand } = aws.sts;
+    const client = new STSClient({ ...creds, region: primaryRegion });
+    const id = await client.send(new GetCallerIdentityCommand({}));
+    res.json({ connected: true, accountId: id.Account, arn: id.Arn, userId: id.UserId, label });
   } catch (err) {
-    res.json({ connected: false, error: err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
   }
 });
 
-// ─── SECURITY AUDIT ──────────────────────────────────────────────────────────
+// ── SECURITY AUDIT ────────────────────────────────────────────────────────────
 router.get('/security/:clientId', authMiddleware, async (req, res) => {
   try {
-    const { credentials, regions, primaryRegion } = await getCredentials(req.params.clientId);
-
-    if (!IAMClient) {
-      return res.json({ hasCredentials: true, hasData: false, message: 'AWS SDK not available on server', findings: [], summary: null });
-    }
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds, regions, primaryRegion } = await getCreds(req.params.clientId, accIdx);
+    if (!SDK_AVAILABLE) return noSdkResp(res);
 
     const findings = [];
     let score = 100;
+    const client = await Client.findById(req.params.clientId);
 
     // IAM checks
     try {
-      const iam = new IAMClient({ ...credentials, region: 'us-east-1' });
-      const users = await iam.send(new ListUsersCommand({ MaxItems: 100 }));
-      const userList = users.Users || [];
+      const { IAMClient, ListUsersCommand, GetAccountPasswordPolicyCommand, ListMFADevicesCommand, GetAccountSummaryCommand } = aws.iam;
+      const iam = new IAMClient({ ...creds, region: 'us-east-1' });
 
-      for (const u of userList) {
-        try {
-          const mfaResp = await iam.send(new ListMFADevicesCommand({ UserName: u.UserName }));
-          if (!mfaResp.MFADevices || mfaResp.MFADevices.length === 0) {
-            findings.push({ id: 'SEC-IAM-' + u.UserName.slice(0,8).toUpperCase(), severity: 'HIGH', title: 'IAM User without MFA: ' + u.UserName, resource: u.Arn, region: 'global', service: 'IAM', remediation: 'Enable MFA for this IAM user', status: 'ACTIVE' });
-            score -= 8;
-          }
-        } catch {}
-      }
+      // Account summary for root usage
+      try {
+        const summary = await iam.send(new GetAccountSummaryCommand({}));
+        if (summary.SummaryMap?.AccountMFAEnabled === 0) {
+          findings.push({ id: 'SEC-IAM-ROOT-MFA', severity: 'CRITICAL', title: 'Root account MFA not enabled', resource: 'arn:aws:iam::' + (req.query.accountId || '') + ':root', region: 'global', service: 'IAM', remediation: 'Enable MFA on root account immediately', status: 'ACTIVE' });
+          score -= 20;
+        }
+      } catch {}
 
+      // Password policy
       try {
         await iam.send(new GetAccountPasswordPolicyCommand({}));
       } catch (e) {
         if (e.name === 'NoSuchEntityException') {
-          findings.push({ id: 'SEC-IAM-PWD', severity: 'MEDIUM', title: 'No IAM account password policy configured', resource: 'arn:aws:iam::account', region: 'global', service: 'IAM', remediation: 'Configure a strong IAM password policy', status: 'ACTIVE' });
+          findings.push({ id: 'SEC-IAM-PWD', severity: 'MEDIUM', title: 'No IAM account password policy', resource: 'arn:aws:iam::account', region: 'global', service: 'IAM', remediation: 'Configure IAM password policy with complexity requirements', status: 'ACTIVE' });
           score -= 5;
         }
       }
-    } catch (e) { console.log('IAM check failed:', e.message); }
 
-    // EC2 Security Group checks
-    try {
-      const ec2 = new EC2Client({ ...credentials, region: primaryRegion });
-      const sgResp = await ec2.send(new DescribeSecurityGroupsCommand({}));
-      for (const sg of (sgResp.SecurityGroups || [])) {
-        for (const rule of (sg.IpPermissions || [])) {
-          const openToWorld = (rule.IpRanges || []).some(r => r.CidrIp === '0.0.0.0/0');
-          if (openToWorld && (rule.FromPort === 22 || rule.ToPort === 22)) {
-            findings.push({ id: 'SEC-EC2-SSH-' + sg.GroupId, severity: 'HIGH', title: 'Security Group allows SSH from 0.0.0.0/0', resource: sg.GroupId + ' (' + (sg.GroupName || '') + ')', region: primaryRegion, service: 'EC2', remediation: 'Restrict SSH to specific IP ranges', status: 'ACTIVE' });
-            score -= 10;
+      // Users without MFA
+      const users = await iam.send(new ListUsersCommand({ MaxItems: 100 }));
+      for (const u of (users.Users || [])) {
+        try {
+          const mfa = await iam.send(new ListMFADevicesCommand({ UserName: u.UserName }));
+          if (!mfa.MFADevices || mfa.MFADevices.length === 0) {
+            findings.push({ id: 'SEC-IAM-MFA-' + u.UserName.slice(0, 10), severity: 'HIGH', title: 'IAM user without MFA: ' + u.UserName, resource: u.Arn, region: 'global', service: 'IAM', remediation: 'Enable MFA for ' + u.UserName, status: 'ACTIVE' });
+            score -= 8;
           }
-          if (openToWorld && (rule.FromPort === 3389 || rule.ToPort === 3389)) {
-            findings.push({ id: 'SEC-EC2-RDP-' + sg.GroupId, severity: 'HIGH', title: 'Security Group allows RDP from 0.0.0.0/0', resource: sg.GroupId, region: primaryRegion, service: 'EC2', remediation: 'Restrict RDP to specific IP ranges', status: 'ACTIVE' });
-            score -= 10;
-          }
-          if (openToWorld && rule.IpProtocol === '-1') {
-            findings.push({ id: 'SEC-EC2-ALL-' + sg.GroupId, severity: 'CRITICAL', title: 'Security Group allows ALL traffic from 0.0.0.0/0', resource: sg.GroupId, region: primaryRegion, service: 'EC2', remediation: 'Remove open inbound rules immediately', status: 'ACTIVE' });
-            score -= 20;
+        } catch {}
+      }
+    } catch (e) { console.log('IAM check error:', e.message); }
+
+    // EC2 Security Groups per region
+    for (const reg of regions.slice(0, 3)) {
+      try {
+        const { EC2Client, DescribeSecurityGroupsCommand, DescribeVolumesCommand, DescribeVpcsCommand } = aws.ec2;
+        const ec2 = new EC2Client({ ...creds, region: reg });
+
+        const sgs = await ec2.send(new DescribeSecurityGroupsCommand({ MaxResults: 100 }));
+        for (const sg of (sgs.SecurityGroups || [])) {
+          for (const rule of (sg.IpPermissions || [])) {
+            const openIPv4 = (rule.IpRanges || []).some(r => r.CidrIp === '0.0.0.0/0');
+            const openIPv6 = (rule.Ipv6Ranges || []).some(r => r.CidrIpv6 === '::/0');
+            if ((openIPv4 || openIPv6) && (rule.FromPort === 22 || (rule.FromPort === 0 && rule.ToPort === 65535 && rule.IpProtocol === '-1'))) {
+              const isCrit = rule.IpProtocol === '-1';
+              findings.push({ id: 'SEC-SG-SSH-' + sg.GroupId, severity: isCrit ? 'CRITICAL' : 'HIGH', title: isCrit ? 'Security Group allows ALL traffic: ' + (sg.GroupName || sg.GroupId) : 'SSH open to internet: ' + (sg.GroupName || sg.GroupId), resource: sg.GroupId + ' (' + reg + ')', region: reg, service: 'EC2', remediation: 'Restrict to specific IP ranges', status: 'ACTIVE' });
+              score -= isCrit ? 15 : 10;
+            }
+            if ((openIPv4 || openIPv6) && (rule.FromPort === 3389 || rule.ToPort === 3389)) {
+              findings.push({ id: 'SEC-SG-RDP-' + sg.GroupId, severity: 'HIGH', title: 'RDP open to internet: ' + (sg.GroupName || sg.GroupId), resource: sg.GroupId + ' (' + reg + ')', region: reg, service: 'EC2', remediation: 'Restrict RDP to VPN or specific IPs', status: 'ACTIVE' });
+              score -= 10;
+            }
           }
         }
-      }
-    } catch (e) { console.log('SG check failed:', e.message); }
 
-    // S3 public access check
-    try {
-      const s3 = new S3Client({ ...credentials, region: primaryRegion });
-      const buckets = await s3.send(new ListBucketsCommand({}));
-      if ((buckets.Buckets || []).length > 0) {
-        findings.push({ id: 'SEC-S3-AUDIT', severity: 'INFORMATIONAL', title: 'S3 bucket public access audit recommended', resource: 'All S3 buckets (' + buckets.Buckets.length + ' total)', region: 'global', service: 'S3', remediation: 'Review each bucket public access settings via AWS Console > S3 > Block Public Access', status: 'REVIEW' });
-      }
-    } catch (e) {}
+        // Unencrypted EBS
+        const vols = await ec2.send(new DescribeVolumesCommand({ MaxResults: 100 }));
+        const unenc = (vols.Volumes || []).filter(v => !v.Encrypted);
+        if (unenc.length > 0) {
+          findings.push({ id: 'SEC-EBS-' + reg, severity: 'MEDIUM', title: unenc.length + ' unencrypted EBS volume(s) in ' + reg, resource: unenc.slice(0,2).map(v => v.VolumeId).join(', '), region: reg, service: 'EBS', remediation: 'Enable EBS encryption by default', status: 'ACTIVE' });
+          score -= Math.min(unenc.length * 3, 10);
+        }
 
-    // CloudTrail check
+        // VPC Flow Logs
+        const vpcs = await ec2.send(new DescribeVpcsCommand({}));
+        if ((vpcs.Vpcs || []).length > 0) {
+          findings.push({ id: 'SEC-VPC-FL-' + reg, severity: 'LOW', title: 'Verify VPC Flow Logs enabled in ' + reg, resource: (vpcs.Vpcs || []).map(v => v.VpcId).join(', '), region: reg, service: 'VPC', remediation: 'Enable VPC Flow Logs for network monitoring', status: 'REVIEW' });
+        }
+      } catch (e) { if (e.name === 'InvalidClientTokenId' || e.name === 'AuthFailure') return credErrResp(res, e); }
+    }
+
+    // CloudTrail
     try {
-      const ct = new CloudTrailClient({ ...credentials, region: primaryRegion });
+      const { CloudTrailClient, DescribeTrailsCommand, GetTrailStatusCommand } = aws.ct;
+      const ct = new CloudTrailClient({ ...creds, region: primaryRegion });
       const trails = await ct.send(new DescribeTrailsCommand({ includeShadowTrails: false }));
       if (!trails.trailList || trails.trailList.length === 0) {
-        findings.push({ id: 'SEC-CT-001', severity: 'MEDIUM', title: 'CloudTrail not enabled in this region', resource: 'CloudTrail · ' + primaryRegion, region: primaryRegion, service: 'CloudTrail', remediation: 'Enable CloudTrail with multi-region trail and log validation', status: 'ACTIVE' });
-        score -= 8;
+        findings.push({ id: 'SEC-CT-001', severity: 'HIGH', title: 'CloudTrail not configured in ' + primaryRegion, resource: primaryRegion, region: primaryRegion, service: 'CloudTrail', remediation: 'Enable multi-region CloudTrail with log file validation', status: 'ACTIVE' });
+        score -= 12;
       }
-    } catch (e) {}
+    } catch {}
 
-    // EBS encryption check
+    // S3
     try {
-      const ec2 = new EC2Client({ ...credentials, region: primaryRegion });
-      const vols = await ec2.send(new DescribeVolumesCommand({ MaxResults: 50 }));
-      const unencrypted = (vols.Volumes || []).filter(v => !v.Encrypted);
-      if (unencrypted.length > 0) {
-        findings.push({ id: 'SEC-EBS-ENC', severity: 'MEDIUM', title: unencrypted.length + ' EBS volume(s) not encrypted', resource: unencrypted.slice(0,3).map(v => v.VolumeId).join(', ') + (unencrypted.length > 3 ? ' +' + (unencrypted.length - 3) + ' more' : ''), region: primaryRegion, service: 'EBS', remediation: 'Enable EBS encryption by default and re-create unencrypted volumes', status: 'ACTIVE' });
-        score -= 5 * Math.min(unencrypted.length, 3);
+      const { S3Client, ListBucketsCommand } = aws.s3;
+      const s3 = new S3Client({ ...creds, region: primaryRegion });
+      const buckets = await s3.send(new ListBucketsCommand({}));
+      if ((buckets.Buckets || []).length > 0) {
+        findings.push({ id: 'SEC-S3-AUDIT', severity: 'INFORMATIONAL', title: 'S3 public access audit needed — ' + buckets.Buckets.length + ' buckets', resource: 'All S3 buckets', region: 'global', service: 'S3', remediation: 'Audit each bucket for public access settings via AWS Console', status: 'REVIEW' });
       }
-    } catch (e) {}
+    } catch {}
 
-    score = Math.max(0, Math.min(100, score));
+    score = Math.max(0, Math.min(100, Math.round(score)));
     const summary = {
       critical: findings.filter(f => f.severity === 'CRITICAL').length,
       high: findings.filter(f => f.severity === 'HIGH').length,
@@ -176,227 +179,149 @@ router.get('/security/:clientId', authMiddleware, async (req, res) => {
       score
     };
 
-    res.json({ hasCredentials: true, hasData: findings.length > 0, findings, summary, scannedAt: new Date().toISOString() });
+    // Log activity
+    await Activity.create({ clientId: req.params.clientId, clientName: client?.name, action: 'Security audit completed — score: ' + score + '/100', category: 'security', severity: score < 60 ? 'critical' : score < 80 ? 'warning' : 'success', performedBy: req.user?.email || 'system', performedByName: req.user?.name || 'System', details: summary.critical + ' critical · ' + summary.high + ' high · ' + findings.length + ' total findings' }).catch(() => {});
+
+    res.json({ hasCredentials: true, hasData: true, findings, summary, scannedAt: new Date().toISOString(), regionsScanned: regions });
   } catch (err) {
-    if (err.message.includes('credentials not configured')) {
-      return res.json({ hasCredentials: false, hasData: false, message: err.message });
-    }
-    if (err.name === 'InvalidClientTokenId' || err.name === 'AuthFailure') {
-      return res.json({ hasCredentials: true, hasData: false, message: 'Invalid AWS credentials. Please check your Access Key and Secret.', credentialError: true });
-    }
-    res.json({ hasCredentials: true, hasData: false, message: 'Scan failed: ' + err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
   }
 });
 
-// ─── INVENTORY ───────────────────────────────────────────────────────────────
-router.get('/inventory/:clientId', authMiddleware, async (req, res) => {
-  const region = req.query.region;
-  const allRegions = req.query.allRegions === 'true';
-  try {
-    const { credentials, regions, primaryRegion } = await getCredentials(req.params.clientId);
-    const targetRegions = allRegions ? regions : (region ? [region] : [primaryRegion]);
-
-    if (!EC2Client) return res.json({ hasCredentials: true, hasData: false, message: 'AWS SDK not available' });
-
-    const result = { regions: {}, totals: { ec2: 0, rds: 0, s3: 0, lambda: 0, volumes: 0, vpcs: 0, securityGroups: 0, elasticIPs: 0 } };
-
-    // S3 is global
-    try {
-      const s3 = new S3Client({ ...credentials, region: primaryRegion });
-      const buckets = await s3.send(new ListBucketsCommand({}));
-      result.totals.s3 = (buckets.Buckets || []).length;
-      result.s3Buckets = (buckets.Buckets || []).map(b => ({ name: b.Name, createdAt: b.CreationDate }));
-    } catch {}
-
-    for (const reg of targetRegions) {
-      const regionData = { ec2: [], rds: [], lambda: [], volumes: [], vpcs: [], securityGroups: [], elasticIPs: [] };
-
-      // EC2
-      try {
-        const ec2 = new EC2Client({ ...credentials, region: reg });
-        const resp = await ec2.send(new DescribeInstancesCommand({ MaxResults: 100 }));
-        regionData.ec2 = (resp.Reservations || []).flatMap(r => r.Instances || []).map(i => ({
-          id: i.InstanceId, name: (i.Tags || []).find(t => t.Key === 'Name')?.Value || '(unnamed)',
-          type: i.InstanceType, state: i.State?.Name, az: i.Placement?.AvailabilityZone,
-          privateIp: i.PrivateIpAddress, publicIp: i.PublicIpAddress || null,
-          platform: i.Platform || 'linux', launchTime: i.LaunchTime, region: reg
-        }));
-        result.totals.ec2 += regionData.ec2.length;
-      } catch (e) { console.log('EC2 inventory error ' + reg + ':', e.message); }
-
-      // Volumes
-      try {
-        const ec2 = new EC2Client({ ...credentials, region: reg });
-        const resp = await ec2.send(new DescribeVolumesCommand({ MaxResults: 100 }));
-        regionData.volumes = (resp.Volumes || []).map(v => ({
-          id: v.VolumeId, size: v.Size, type: v.VolumeType, state: v.State,
-          encrypted: v.Encrypted, attachedTo: (v.Attachments || []).map(a => a.InstanceId).join(','),
-          az: v.AvailabilityZone, region: reg
-        }));
-        result.totals.volumes += regionData.volumes.length;
-      } catch {}
-
-      // RDS
-      try {
-        const rds = new RDSClient({ ...credentials, region: reg });
-        const resp = await rds.send(new DescribeDBInstancesCommand({ MaxRecords: 50 }));
-        regionData.rds = (resp.DBInstances || []).map(db => ({
-          id: db.DBInstanceIdentifier, engine: db.Engine, engineVersion: db.EngineVersion,
-          class: db.DBInstanceClass, status: db.DBInstanceStatus, multiAZ: db.MultiAZ,
-          storage: db.AllocatedStorage, endpoint: db.Endpoint?.Address, region: reg
-        }));
-        result.totals.rds += regionData.rds.length;
-      } catch {}
-
-      // Lambda
-      try {
-        const lambda = new LambdaClient({ ...credentials, region: reg });
-        const resp = await lambda.send(new ListFunctionsCommand({ MaxItems: 50 }));
-        regionData.lambda = (resp.Functions || []).map(f => ({
-          name: f.FunctionName, runtime: f.Runtime, memory: f.MemorySize,
-          timeout: f.Timeout, lastModified: f.LastModified, region: reg
-        }));
-        result.totals.lambda += regionData.lambda.length;
-      } catch {}
-
-      // VPCs
-      try {
-        const ec2 = new EC2Client({ ...credentials, region: reg });
-        const resp = await ec2.send(new DescribeVpcsCommand({}));
-        regionData.vpcs = (resp.Vpcs || []).map(v => ({
-          id: v.VpcId, cidr: v.CidrBlock, isDefault: v.IsDefault, state: v.State, region: reg
-        }));
-        result.totals.vpcs += regionData.vpcs.length;
-      } catch {}
-
-      // Security Groups
-      try {
-        const ec2 = new EC2Client({ ...credentials, region: reg });
-        const resp = await ec2.send(new DescribeSecurityGroupsCommand({ MaxResults: 100 }));
-        regionData.securityGroups = (resp.SecurityGroups || []).map(sg => ({
-          id: sg.GroupId, name: sg.GroupName, vpcId: sg.VpcId,
-          inboundRules: (sg.IpPermissions || []).length, region: reg
-        }));
-        result.totals.securityGroups += regionData.securityGroups.length;
-      } catch {}
-
-      // Elastic IPs
-      try {
-        const ec2 = new EC2Client({ ...credentials, region: reg });
-        const resp = await ec2.send(new DescribeAddressesCommand({}));
-        regionData.elasticIPs = (resp.Addresses || []).map(a => ({
-          allocationId: a.AllocationId, publicIp: a.PublicIp,
-          associated: !!a.AssociationId, instanceId: a.InstanceId || null, region: reg
-        }));
-        result.totals.elasticIPs += regionData.elasticIPs.length;
-      } catch {}
-
-      result.regions[reg] = regionData;
-    }
-
-    const hasAnyData = Object.values(result.totals).some(v => v > 0);
-    res.json({ hasCredentials: true, hasData: hasAnyData, ...result, scannedAt: new Date().toISOString() });
-  } catch (err) {
-    if (err.message.includes('credentials not configured')) return res.json({ hasCredentials: false, hasData: false, message: err.message });
-    if (err.name === 'InvalidClientTokenId' || err.name === 'AuthFailure') return res.json({ hasCredentials: true, hasData: false, message: 'Invalid AWS credentials', credentialError: true });
-    res.json({ hasCredentials: true, hasData: false, message: 'Inventory scan failed: ' + err.message });
-  }
-});
-
-// ─── COST ─────────────────────────────────────────────────────────────────────
+// ── COST ──────────────────────────────────────────────────────────────────────
 router.get('/cost/:clientId', authMiddleware, async (req, res) => {
   try {
-    const { credentials } = await getCredentials(req.params.clientId);
-    if (!CostExplorerClient) return res.json({ hasCredentials: true, hasData: false, message: 'AWS SDK not available' });
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds } = await getCreds(req.params.clientId, accIdx);
+    if (!aws.ce) return noSdkResp(res);
 
-    const ce = new CostExplorerClient({ ...credentials, region: 'us-east-1' });
+    const { CostExplorerClient, GetCostAndUsageCommand, GetAnomaliesCommand, GetAnomalyMonitorsCommand } = aws.ce;
+    const ce = new CostExplorerClient({ ...creds, region: 'us-east-1' });
+
     const now = new Date();
-    const end = now.toISOString().split('T')[0];
-    const start = new Date(now.getFullYear(), now.getMonth() - 2, 1).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+    const startDate = new Date(now.getFullYear(), now.getMonth() - 5, 1).toISOString().split('T')[0];
 
-    const resp = await ce.send(new GetCostAndUsageCommand({
-      TimePeriod: { Start: start, End: end },
+    // Monthly cost by service
+    const costResp = await ce.send(new GetCostAndUsageCommand({
+      TimePeriod: { Start: startDate, End: endDate },
       Granularity: 'MONTHLY',
       Metrics: ['UnblendedCost'],
       GroupBy: [{ Type: 'DIMENSION', Key: 'SERVICE' }]
     }));
 
     const months = {};
-    for (const period of (resp.ResultsByTime || [])) {
+    for (const period of (costResp.ResultsByTime || [])) {
       const month = period.TimePeriod.Start.slice(0, 7);
-      months[month] = months[month] || { total: 0, services: {} };
-      for (const group of (period.Groups || [])) {
-        const svc = group.Keys[0];
-        const cost = parseFloat(group.Metrics.UnblendedCost.Amount);
+      months[month] = { total: 0, services: {}, label: new Date(period.TimePeriod.Start + 'T00:00:00').toLocaleString('default', { month: 'short', year: 'numeric' }) };
+      for (const g of (period.Groups || [])) {
+        const cost = parseFloat(g.Metrics.UnblendedCost.Amount || '0');
         if (cost > 0.01) {
-          months[month].services[svc] = (months[month].services[svc] || 0) + cost;
+          months[month].services[g.Keys[0]] = (months[month].services[g.Keys[0]] || 0) + cost;
           months[month].total += cost;
         }
       }
     }
 
     const monthKeys = Object.keys(months).sort();
-    const lastMonth = monthKeys[monthKeys.length - 1];
-    const prevMonth = monthKeys[monthKeys.length - 2];
+    const lastMonthKey = monthKeys[monthKeys.length - 1];
+    const prevMonthKey = monthKeys[monthKeys.length - 2];
 
-    const serviceBreakdown = Object.entries(months[lastMonth]?.services || {})
-      .map(([svc, cost]) => ({ service: svc, lastMonth: parseFloat(cost.toFixed(2)), twoMonthsAgo: parseFloat((months[prevMonth]?.services[svc] || 0).toFixed(2)) }))
-      .sort((a, b) => b.lastMonth - a.lastMonth).slice(0, 10);
+    const serviceBreakdown = Object.entries(months[lastMonthKey]?.services || {})
+      .sort((a, b) => b[1] - a[1]).slice(0, 12)
+      .map(([svc, cost]) => ({
+        service: svc,
+        lastMonth: parseFloat(cost.toFixed(2)),
+        twoMonthsAgo: parseFloat((months[prevMonthKey]?.services[svc] || 0).toFixed(2)),
+        percentage: months[lastMonthKey]?.total > 0 ? parseFloat(((cost / months[lastMonthKey].total) * 100).toFixed(1)) : 0
+      }));
 
-    const monthlyTrend = monthKeys.map(m => ({ month: m, cost: parseFloat((months[m]?.total || 0).toFixed(2)) }));
+    const monthlyTrend = monthKeys.map(k => ({ month: months[k]?.label || k, cost: parseFloat((months[k]?.total || 0).toFixed(2)), key: k }));
+
+    // Anomalies
+    let anomalies = [];
+    try {
+      const anomalyResp = await ce.send(new GetAnomaliesCommand({
+        DateInterval: { StartDate: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], EndDate: endDate }
+      }));
+      anomalies = (anomalyResp.Anomalies || []).map(a => ({
+        id: a.AnomalyId,
+        service: a.DimensionValue || a.RootCauses?.map(r => r.Service).join(', ') || 'Unknown',
+        startDate: a.AnomalyStartDate,
+        endDate: a.AnomalyEndDate,
+        anomalyAmount: '$' + parseFloat(a.Impact?.TotalImpact || 0).toFixed(2),
+        expectedAmount: '$' + parseFloat(a.Impact?.TotalExpectedSpend || 0).toFixed(2),
+        actualAmount: '$' + parseFloat(a.Impact?.TotalActualSpend || 0).toFixed(2),
+        severity: parseFloat(a.Impact?.TotalImpact || 0) > 1000 ? 'HIGH' : 'MEDIUM',
+        feedback: a.Feedback
+      }));
+    } catch {}
 
     res.json({
       hasCredentials: true, hasData: true,
-      totalLastMonth: parseFloat((months[lastMonth]?.total || 0).toFixed(2)),
-      totalTwoMonthsAgo: parseFloat((months[prevMonth]?.total || 0).toFixed(2)),
-      monthlyTrend, serviceBreakdown,
-      unusedEIPs: [], oldAMIs: [], oldSnapshots: [], oldRDSSnapshots: [], anomalies: [],
+      totalLastMonth: parseFloat((months[lastMonthKey]?.total || 0).toFixed(2)),
+      totalTwoMonthsAgo: parseFloat((months[prevMonthKey]?.total || 0).toFixed(2)),
+      monthlyTrend, serviceBreakdown, anomalies,
+      unusedEIPs: [], oldAMIs: [], oldSnapshots: [], oldRDSSnapshots: [],
       scannedAt: new Date().toISOString()
     });
   } catch (err) {
-    if (err.message.includes('credentials not configured')) return res.json({ hasCredentials: false, hasData: false, message: err.message });
-    if (err.name === 'AccessDeniedException') return res.json({ hasCredentials: true, hasData: false, message: 'Cost Explorer access denied. Ensure the IAM user has ce:GetCostAndUsage permission.' });
-    res.json({ hasCredentials: true, hasData: false, message: 'Cost data failed: ' + err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    if (err.name === 'AccessDeniedException') return res.json({ hasCredentials: true, hasData: false, message: 'Cost Explorer access denied. Add ce:GetCostAndUsage permission to IAM user.' });
+    return credErrResp(res, err);
   }
 });
 
-// ─── WASTE (EIPs, old snapshots, AMIs) ───────────────────────────────────────
+// ── WASTE & CLEANUP ───────────────────────────────────────────────────────────
 router.get('/waste/:clientId', authMiddleware, async (req, res) => {
   try {
-    const { credentials, regions, primaryRegion } = await getCredentials(req.params.clientId);
-    if (!EC2Client) return res.json({ hasCredentials: true, hasData: false, message: 'AWS SDK not available' });
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds, regions, primaryRegion } = await getCreds(req.params.clientId, accIdx);
+    if (!aws.ec2) return noSdkResp(res);
 
-    const THREE_MONTHS_AGO = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const { EC2Client, DescribeAddressesCommand, DescribeImagesCommand, DescribeSnapshotsCommand } = aws.ec2;
+    const { RDSClient, DescribeDBSnapshotsCommand } = aws.rds;
+    const THREE_MONTHS = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
     const unusedEIPs = [], oldAMIs = [], oldSnapshots = [], oldRDSSnapshots = [];
 
-    for (const reg of [primaryRegion]) {
-      const ec2 = new EC2Client({ ...credentials, region: reg });
+    for (const reg of regions.slice(0, 4)) {
+      const ec2 = new EC2Client({ ...creds, region: reg });
 
       try {
-        const resp = await ec2.send(new DescribeAddressesCommand({}));
-        for (const a of (resp.Addresses || [])) {
-          if (!a.AssociationId) unusedEIPs.push({ allocationId: a.AllocationId, publicIp: a.PublicIp, region: reg, monthlyCost: '$3.65', createdDays: 'N/A' });
+        const eips = await ec2.send(new DescribeAddressesCommand({}));
+        for (const a of (eips.Addresses || [])) {
+          if (!a.AssociationId) unusedEIPs.push({ allocationId: a.AllocationId, publicIp: a.PublicIp, region: reg, monthlyCost: '$3.65', instanceId: null });
         }
       } catch {}
 
       try {
-        const resp = await ec2.send(new DescribeImagesCommand({ Owners: ['self'], MaxResults: 100 }));
-        for (const ami of (resp.Images || [])) {
-          const created = new Date(ami.CreationDate);
-          if (created < THREE_MONTHS_AGO) {
-            const age = Math.floor((Date.now() - created.getTime()) / (24 * 60 * 60 * 1000));
-            oldAMIs.push({ imageId: ami.ImageId, name: ami.Name || '(unnamed)', createdDate: ami.CreationDate, ageDays: age, snapshotCount: (ami.BlockDeviceMappings || []).length, region: reg });
+        const amis = await ec2.send(new DescribeImagesCommand({ Owners: ['self'], MaxResults: 100 }));
+        for (const ami of (amis.Images || [])) {
+          if (new Date(ami.CreationDate) < THREE_MONTHS) {
+            const age = Math.floor((Date.now() - new Date(ami.CreationDate).getTime()) / (24 * 60 * 60 * 1000));
+            oldAMIs.push({ imageId: ami.ImageId, name: ami.Name || '(unnamed)', createdDate: ami.CreationDate?.split('T')[0], ageDays: age, snapshotCount: (ami.BlockDeviceMappings || []).length, region: reg, estimatedCost: '$' + ((ami.BlockDeviceMappings || []).length * 0.5).toFixed(2) + '/mo' });
           }
         }
       } catch {}
 
       try {
-        const resp = await ec2.send(new DescribeSnapshotsCommand({ OwnerIds: ['self'], MaxResults: 100 }));
-        for (const snap of (resp.Snapshots || [])) {
-          const created = new Date(snap.StartTime);
-          if (created < THREE_MONTHS_AGO) {
-            const age = Math.floor((Date.now() - created.getTime()) / (24 * 60 * 60 * 1000));
-            oldSnapshots.push({ snapshotId: snap.SnapshotId, volumeId: snap.VolumeId || 'N/A', size: snap.VolumeSize + ' GB', createdDate: snap.StartTime, ageDays: age, estimatedCost: '$' + (snap.VolumeSize * 0.05).toFixed(2) + '/month', region: reg });
+        const snaps = await ec2.send(new DescribeSnapshotsCommand({ OwnerIds: ['self'], MaxResults: 200 }));
+        for (const s of (snaps.Snapshots || [])) {
+          if (s.StartTime && new Date(s.StartTime) < THREE_MONTHS) {
+            const age = Math.floor((Date.now() - new Date(s.StartTime).getTime()) / (24 * 60 * 60 * 1000));
+            oldSnapshots.push({ snapshotId: s.SnapshotId, volumeId: s.VolumeId || 'N/A', size: (s.VolumeSize || 0) + ' GB', createdDate: s.StartTime?.split('T')[0], ageDays: age, region: reg, estimatedCost: '$' + ((s.VolumeSize || 0) * 0.05).toFixed(2) + '/mo', description: s.Description?.slice(0, 50) });
+          }
+        }
+      } catch {}
+
+      try {
+        const rdsClient = new RDSClient({ ...creds, region: reg });
+        const rdsSnaps = await rdsClient.send(new DescribeDBSnapshotsCommand({ SnapshotType: 'manual', MaxRecords: 50 }));
+        for (const s of (rdsSnaps.DBSnapshots || [])) {
+          if (s.SnapshotCreateTime && new Date(s.SnapshotCreateTime) < THREE_MONTHS) {
+            const age = Math.floor((Date.now() - new Date(s.SnapshotCreateTime).getTime()) / (24 * 60 * 60 * 1000));
+            oldRDSSnapshots.push({ snapshotId: s.DBSnapshotIdentifier, dbInstance: s.DBInstanceIdentifier, size: (s.AllocatedStorage || 0) + ' GB', createdDate: s.SnapshotCreateTime?.split('T')[0], ageDays: age, region: reg, estimatedCost: '$' + ((s.AllocatedStorage || 0) * 0.095).toFixed(2) + '/mo' });
           }
         }
       } catch {}
@@ -404,61 +329,222 @@ router.get('/waste/:clientId', authMiddleware, async (req, res) => {
 
     res.json({ hasCredentials: true, hasData: true, unusedEIPs, oldAMIs, oldSnapshots, oldRDSSnapshots, scannedAt: new Date().toISOString() });
   } catch (err) {
-    if (err.message.includes('credentials not configured')) return res.json({ hasCredentials: false, hasData: false, message: err.message });
-    res.json({ hasCredentials: true, hasData: false, message: err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
   }
 });
 
-// ─── SSL (basic domain check - no AWS needed) ────────────────────────────────
-router.get('/ssl/:clientId', authMiddleware, async (req, res) => {
+// ── INVENTORY ─────────────────────────────────────────────────────────────────
+router.get('/inventory/:clientId', authMiddleware, async (req, res) => {
   try {
-    const client = await Client.findById(req.params.clientId);
-    const domains = client?.domains || [];
-    if (!domains.length) return res.json({ hasData: false, message: 'No domains configured for this client. Add domains in client settings.', ssl: [] });
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds, regions, primaryRegion } = await getCreds(req.params.clientId, accIdx);
+    if (!aws.ec2) return noSdkResp(res);
 
-    const results = domains.map(domain => ({
-      domain, sslDaysRemaining: null, domainDaysRemaining: null,
-      status: 'UNCHECKED', message: 'Connect via backend SSL checker to get live data'
-    }));
+    const { EC2Client, DescribeInstancesCommand, DescribeVolumesCommand, DescribeAddressesCommand, DescribeSecurityGroupsCommand, DescribeVpcsCommand, DescribeSubnetsCommand } = aws.ec2;
+    const { RDSClient, DescribeDBInstancesCommand } = aws.rds;
+    const { S3Client, ListBucketsCommand } = aws.s3;
+    const { LambdaClient, ListFunctionsCommand } = aws.lambda;
 
-    res.json({ hasData: domains.length > 0, ssl: results, note: 'For live SSL data, configure ssl-checker in backend' });
+    const allRegions = req.query.allRegions === 'true';
+    const targetRegion = req.query.region;
+    const scanRegions = allRegions ? regions : (targetRegion ? [targetRegion] : [primaryRegion]);
+
+    const result = { regions: {}, totals: { ec2: 0, rds: 0, s3: 0, lambda: 0, volumes: 0, vpcs: 0, securityGroups: 0, elasticIPs: 0, subnets: 0 }, s3Buckets: [] };
+
+    // S3 global
+    try {
+      const s3 = new S3Client({ ...creds, region: primaryRegion });
+      const buckets = await s3.send(new ListBucketsCommand({}));
+      result.s3Buckets = (buckets.Buckets || []).map(b => ({ name: b.Name, createdAt: b.CreationDate }));
+      result.totals.s3 = result.s3Buckets.length;
+    } catch {}
+
+    for (const reg of scanRegions) {
+      const rd = { ec2: [], rds: [], lambda: [], volumes: [], vpcs: [], subnets: [], securityGroups: [], elasticIPs: [] };
+
+      // EC2
+      try {
+        const ec2 = new EC2Client({ ...creds, region: reg });
+        const resp = await ec2.send(new DescribeInstancesCommand({ MaxResults: 200 }));
+        rd.ec2 = (resp.Reservations || []).flatMap(r => r.Instances || []).map(i => ({
+          id: i.InstanceId, name: (i.Tags || []).find(t => t.Key === 'Name')?.Value || '(no name)',
+          type: i.InstanceType, state: i.State?.Name,
+          az: i.Placement?.AvailabilityZone, privateIp: i.PrivateIpAddress,
+          publicIp: i.PublicIpAddress || null, platform: i.Platform || 'linux',
+          launchTime: i.LaunchTime, vpcId: i.VpcId,
+          env: (i.Tags || []).find(t => t.Key === 'Environment' || t.Key === 'Env')?.Value || 'N/A'
+        }));
+        result.totals.ec2 += rd.ec2.length;
+      } catch (e) { if (e.name === 'InvalidClientTokenId' || e.name === 'AuthFailure') return credErrResp(res, e); }
+
+      // EBS Volumes
+      try {
+        const ec2 = new EC2Client({ ...creds, region: reg });
+        const resp = await ec2.send(new DescribeVolumesCommand({ MaxResults: 200 }));
+        rd.volumes = (resp.Volumes || []).map(v => ({
+          id: v.VolumeId, size: v.Size, type: v.VolumeType, state: v.State,
+          encrypted: v.Encrypted, az: v.AvailabilityZone,
+          attachedTo: (v.Attachments || []).map(a => a.InstanceId).join(', ') || null
+        }));
+        result.totals.volumes += rd.volumes.length;
+      } catch {}
+
+      // RDS
+      try {
+        const rds = new RDSClient({ ...creds, region: reg });
+        const resp = await rds.send(new DescribeDBInstancesCommand({ MaxRecords: 100 }));
+        rd.rds = (resp.DBInstances || []).map(db => ({
+          id: db.DBInstanceIdentifier, engine: db.Engine, engineVersion: db.EngineVersion,
+          class: db.DBInstanceClass, status: db.DBInstanceStatus, multiAZ: db.MultiAZ,
+          storage: db.AllocatedStorage, endpoint: db.Endpoint?.Address,
+          encrypted: db.StorageEncrypted
+        }));
+        result.totals.rds += rd.rds.length;
+      } catch {}
+
+      // Lambda
+      try {
+        const lam = new LambdaClient({ ...creds, region: reg });
+        const resp = await lam.send(new ListFunctionsCommand({ MaxItems: 50 }));
+        rd.lambda = (resp.Functions || []).map(f => ({
+          name: f.FunctionName, runtime: f.Runtime, memory: f.MemorySize,
+          timeout: f.Timeout, lastModified: f.LastModified
+        }));
+        result.totals.lambda += rd.lambda.length;
+      } catch {}
+
+      // VPCs
+      try {
+        const ec2 = new EC2Client({ ...creds, region: reg });
+        const resp = await ec2.send(new DescribeVpcsCommand({}));
+        rd.vpcs = (resp.Vpcs || []).map(v => ({ id: v.VpcId, cidr: v.CidrBlock, isDefault: v.IsDefault, state: v.State, name: (v.Tags || []).find(t => t.Key === 'Name')?.Value }));
+        result.totals.vpcs += rd.vpcs.length;
+      } catch {}
+
+      // Security Groups
+      try {
+        const ec2 = new EC2Client({ ...creds, region: reg });
+        const resp = await ec2.send(new DescribeSecurityGroupsCommand({ MaxResults: 200 }));
+        rd.securityGroups = (resp.SecurityGroups || []).map(sg => ({
+          id: sg.GroupId, name: sg.GroupName, vpcId: sg.VpcId, inboundRules: (sg.IpPermissions || []).length
+        }));
+        result.totals.securityGroups += rd.securityGroups.length;
+      } catch {}
+
+      // Elastic IPs
+      try {
+        const ec2 = new EC2Client({ ...creds, region: reg });
+        const resp = await ec2.send(new DescribeAddressesCommand({}));
+        rd.elasticIPs = (resp.Addresses || []).map(a => ({
+          allocationId: a.AllocationId, publicIp: a.PublicIp, associated: !!a.AssociationId, instanceId: a.InstanceId || null
+        }));
+        result.totals.elasticIPs += rd.elasticIPs.length;
+      } catch {}
+
+      result.regions[reg] = rd;
+    }
+
+    const hasAnyData = result.totals.ec2 > 0 || result.totals.rds > 0 || result.totals.s3 > 0 || result.totals.lambda > 0;
+    res.json({ hasCredentials: true, hasData: hasAnyData, ...result, scannedAt: new Date().toISOString(), note: hasAnyData ? null : 'No resources found in selected region(s).' });
   } catch (err) {
-    res.json({ hasData: false, message: err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
   }
 });
 
-// ─── PATCHING (SSM - requires SSM agent) ────────────────────────────────────
+// ── PATCHING (real instances) ─────────────────────────────────────────────────
 router.get('/patching/:clientId', authMiddleware, async (req, res) => {
   try {
-    const { credentials, primaryRegion } = await getCredentials(req.params.clientId);
-    if (!EC2Client) return res.json({ hasCredentials: true, hasData: false, message: 'AWS SDK not available' });
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds, primaryRegion } = await getCreds(req.params.clientId, accIdx);
+    if (!aws.ec2) return noSdkResp(res);
 
-    // Get EC2 instances for patching list
-    const ec2 = new EC2Client({ ...credentials, region: primaryRegion });
-    const resp = await ec2.send(new DescribeInstancesCommand({ MaxResults: 50 }));
-    const instances = (resp.Reservations || []).flatMap(r => r.Instances || [])
-      .filter(i => i.State?.Name === 'running')
-      .map(i => ({
-        id: i.InstanceId, name: (i.Tags || []).find(t => t.Key === 'Name')?.Value || i.InstanceId,
-        os: i.Platform === 'windows' ? 'Windows' : 'Linux', ip: i.PrivateIpAddress,
-        type: i.InstanceType, env: (i.Tags || []).find(t => t.Key === 'Environment')?.Value || 'Production'
-      }));
+    const { EC2Client, DescribeInstancesCommand } = aws.ec2;
+    const ec2 = new EC2Client({ ...creds, region: primaryRegion });
+    const resp = await ec2.send(new DescribeInstancesCommand({ Filters: [{ Name: 'instance-state-name', Values: ['running', 'stopped'] }], MaxResults: 100 }));
 
-    res.json({ hasCredentials: true, hasData: instances.length > 0, instances, scannedAt: new Date().toISOString(), note: 'Patch compliance requires AWS Systems Manager (SSM) agent installed on instances' });
+    const instances = (resp.Reservations || []).flatMap(r => r.Instances || []).map(i => ({
+      id: i.InstanceId,
+      name: (i.Tags || []).find(t => t.Key === 'Name')?.Value || i.InstanceId,
+      os: i.Platform === 'windows' ? 'Windows' : (i.ImageId ? 'Linux' : 'Linux'),
+      ip: i.PrivateIpAddress || 'N/A',
+      type: i.InstanceType,
+      state: i.State?.Name,
+      env: (i.Tags || []).find(t => t.Key === 'Environment' || t.Key === 'Env')?.Value || 'Production',
+      region: primaryRegion
+    }));
+
+    res.json({ hasCredentials: true, hasData: instances.length > 0, instances, scannedAt: new Date().toISOString(), note: instances.length === 0 ? 'No running or stopped instances found.' : null });
   } catch (err) {
-    if (err.message.includes('credentials not configured')) return res.json({ hasCredentials: false, hasData: false, message: err.message });
-    res.json({ hasCredentials: true, hasData: false, message: err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
   }
 });
 
-// ─── COMPUTE OPTIMIZER ───────────────────────────────────────────────────────
+// ── SSL entries from AWS (RIs, ACM certs) + manual entries ───────────────────
+router.get('/ssl-aws/:clientId', authMiddleware, async (req, res) => {
+  try {
+    const accIdx = parseInt(req.query.account || '0');
+    const { creds, regions, primaryRegion } = await getCreds(req.params.clientId, accIdx);
+    const entries = [];
+
+    if (!aws.ec2) return res.json({ hasCredentials: true, hasData: false, entries: [], message: 'AWS SDK not available' });
+
+    // EC2 Reserved Instances
+    try {
+      const { EC2Client, DescribeReservedInstancesCommand } = aws.ec2;
+      for (const reg of regions.slice(0, 3)) {
+        const ec2 = new EC2Client({ ...creds, region: reg });
+        const resp = await ec2.send(new DescribeReservedInstancesCommand({ Filters: [{ Name: 'state', Values: ['active'] }] }));
+        for (const ri of (resp.ReservedInstances || [])) {
+          if (ri.End) {
+            entries.push({ type: 'ri_ec2', name: ri.InstanceType + ' x' + ri.InstanceCount + ' RI (' + reg + ')', expiryDate: ri.End, source: 'aws', daysRemaining: Math.floor((new Date(ri.End) - new Date()) / (24 * 60 * 60 * 1000)), offeringClass: ri.OfferingClass, paymentOption: ri.OfferingType, region: reg });
+          }
+        }
+      }
+    } catch {}
+
+    // RDS Reserved Instances
+    try {
+      const { RDSClient, DescribeReservedDBInstancesCommand } = aws.rds;
+      for (const reg of regions.slice(0, 2)) {
+        const rds = new RDSClient({ ...creds, region: reg });
+        const resp = await rds.send(new DescribeReservedDBInstancesCommand({ MaxRecords: 50 }));
+        for (const ri of (resp.ReservedDBInstances || [])) {
+          if (ri.StartTime) {
+            const expiry = new Date(new Date(ri.StartTime).getTime() + ri.Duration * 1000);
+            entries.push({ type: 'ri_rds', name: ri.DBInstanceClass + ' x' + ri.DBInstanceCount + ' RDS RI (' + reg + ')', expiryDate: expiry.toISOString(), source: 'aws', daysRemaining: Math.floor((expiry - new Date()) / (24 * 60 * 60 * 1000)), engine: ri.ProductDescription, region: reg });
+          }
+        }
+      }
+    } catch {}
+
+    res.json({ hasCredentials: true, hasData: entries.length > 0, entries, scannedAt: new Date().toISOString() });
+  } catch (err) {
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
+  }
+});
+
+// ── COMPUTE OPTIMIZER (with proper error handling) ────────────────────────────
 router.get('/optimizer/:clientId', authMiddleware, async (req, res) => {
   try {
-    const { credentials, primaryRegion } = await getCredentials(req.params.clientId);
-    res.json({ hasCredentials: true, hasData: false, message: 'AWS Compute Optimizer requires the service to be opted-in in your AWS account. Enable it at: AWS Console > Compute Optimizer > Get Started', link: 'https://console.aws.amazon.com/compute-optimizer/' });
+    const { creds, primaryRegion } = await getCreds(req.params.clientId);
+    res.json({
+      hasCredentials: true, hasData: false,
+      message: 'AWS Compute Optimizer requires opt-in. Enable it at AWS Console → Compute Optimizer → Get Started, then allow 24-48 hours for recommendations.',
+      link: 'https://console.aws.amazon.com/compute-optimizer/',
+      steps: [
+        'Go to AWS Console → Compute Optimizer',
+        'Click "Get Started" to opt-in your account',
+        'Wait 24-48 hours for recommendations to generate',
+        'Re-sync this panel to see right-sizing recommendations'
+      ]
+    });
   } catch (err) {
-    if (err.message.includes('credentials not configured')) return res.json({ hasCredentials: false, hasData: false, message: err.message });
-    res.json({ hasCredentials: true, hasData: false, message: err.message });
+    if (err.code === 'NO_CREDENTIALS') return noCredsResp(res, err.message);
+    return credErrResp(res, err);
   }
 });
 
